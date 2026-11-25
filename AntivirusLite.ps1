@@ -2,7 +2,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    AntivirusLite v3.5.2 - Behavioral EDR for Windows 10/11
+    AntivirusLite v4.0.0 - Unified file and behavioral monitor for Windows 10/11
     Author: Gorstak
     Website: https://gorstak.eu
 .DESCRIPTION
@@ -10,7 +10,14 @@
     processes DO, not what they're called. Assumes the attacker has read
     this source code.
 
-    Active response (kill) and best-effort hash reputation are ON by default.
+    Combines AntivirusLite, the original file antivirus, Sentinel, Antivirus,
+    GorstaksEDR, and the later merged Antivirus: behavioral correlation,
+    bounded file scanning, AMSI, hash reputation, persistence inventory,
+    recoverable quarantine, circuit breakers, self-test and health telemetry.
+    Companion mode is the default: leave process termination and quarantine to
+    the installed AV/EDR. -ResponseMode Standalone explicitly enables response.
+    Best-effort hash reputation is enabled unless -NoNetwork is specified.
+    Use -AuditMode to log proposed responses without killing or quarantining.
     Copies itself to an administrator-controlled ProgramData folder, registers
     an elevated interactive logon task for the installing user, and launches it
     immediately with a hidden console. No extra switches. Clipboard inspection
@@ -21,10 +28,43 @@
 
 .PARAMETER Uninstall
     Remove scheduled task, stop running instances, and exit.
+.PARAMETER AuditMode
+    Log detections without terminating processes or removing files.
+.PARAMETER ResponseMode
+    Companion (default) observes only. Standalone enables process termination
+    and quarantine of files confirmed malicious by AMSI or hash reputation.
+.PARAMETER NoNetwork
+    Disable external hash lookups. AMSI may still use its provider's own network.
+.PARAMETER Foreground
+    Run the monitor directly without installing a scheduled task.
+.PARAMETER ScanPath
+    Scan a file or directory once without installing. Reparse points are skipped.
+.PARAMETER ListQuarantine
+    List quarantine metadata without starting the monitor.
+.PARAMETER Restore
+    Restore the specified quarantine ID to the explicit RestorePath. Never overwrites.
+.PARAMETER RestorePath
+    Full destination file path for Restore; its parent directory must already exist.
+.PARAMETER SelfTest
+    Run local storage, archive, telemetry and AMSI diagnostics without installing,
+    creating test malware, changing security settings, or remediating files.
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName='Monitor')]
 param(
-    [switch]$Uninstall
+    [Parameter(ParameterSetName='Monitor')][switch]$Uninstall,
+    [Parameter(ParameterSetName='Monitor')][switch]$Foreground,
+    [Parameter(ParameterSetName='Monitor')][switch]$Install,
+    [Parameter(ParameterSetName='Monitor')]
+    [Parameter(ParameterSetName='Scan')][switch]$AuditMode,
+    [Parameter(ParameterSetName='Monitor')]
+    [Parameter(ParameterSetName='Scan')][switch]$NoNetwork,
+    [Parameter(ParameterSetName='Monitor')]
+    [Parameter(ParameterSetName='Scan')][ValidateSet('Companion','Standalone')][string]$ResponseMode = 'Companion',
+    [Parameter(Mandatory,ParameterSetName='Scan')][string]$ScanPath,
+    [Parameter(Mandatory,ParameterSetName='List')][switch]$ListQuarantine,
+    [Parameter(Mandatory,ParameterSetName='Restore')][ValidatePattern('^[a-fA-F0-9]{32}$')][string]$Restore,
+    [Parameter(Mandatory,ParameterSetName='Restore')][string]$RestorePath,
+    [Parameter(Mandatory,ParameterSetName='SelfTest')][switch]$SelfTest
 )
 
 $ErrorActionPreference = "Continue"
@@ -39,7 +79,7 @@ $Script:ScanIntervalSeconds = 5
 # ============================================================================
 # GLOBALS & STATE
 # ============================================================================
-$Script:Version = "3.5.2"
+$Script:Version = "4.0.0"
 if ([IntPtr]::Size -ne 8) { throw 'Use 64-bit Windows PowerShell 5.1 or later.' }
 $Script:IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $Script:Dedup = @{}
@@ -63,6 +103,22 @@ $Script:DnsQueryTracker = @{}
 $Script:TaskName = "AntivirusLite"
 $Script:InstallDirectory = Join-Path $env:ProgramData "AntivirusLite"
 $Script:InstalledScript = Join-Path $Script:InstallDirectory "AntivirusLite.ps1"
+$Script:QuarantineDirectory = Join-Path $Script:InstallDirectory 'Quarantine'
+$Script:AuditOnly = [bool]$AuditMode -or $ResponseMode -eq 'Companion'
+$Script:ResponseMode = $ResponseMode
+$Script:Offline = [bool]$NoNetwork
+$Script:FileVerdicts = @{}
+$Script:PendingFiles = New-Object 'System.Collections.Generic.Queue[string]'
+$Script:PendingFileSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$Script:MaxScanBytes = 32MB
+$Script:AMSIContext = [IntPtr]::Zero
+$Script:AMSIAvailable = $false
+$Script:CircuitBreakers = @{}
+$Script:StageHealth = @{}
+$Script:EventWatermarks = @{}
+$Script:SecurityBaseline = @{}
+$Script:ScanExtensions = @('.exe','.dll','.sys','.scr','.com','.cpl','.msi','.ocx',
+    '.ps1','.psm1','.psd1','.bat','.cmd','.vbs','.js','.jse','.wsf','.hta')
 
 # JIT/Electron - legitimately have RWX memory (exclude from memory scan)
 $Script:JitPaths = @(
@@ -135,7 +191,7 @@ function Log-Event {
         ruleName=$Rule; evidence=$Evidence; reasoning=$Reasoning
         confidence=$Conf; tier=$Tier; processName=$PName; processId=$ProcessId; metadata=$Meta
     }}
-    $json = $obj | ConvertTo-Json -Depth 5 -Compress
+    $json = $obj | ConvertTo-Json -Depth 10 -Compress
     try { Rotate-Log; Add-Content -Path $Script:LogPath -Value $json -Encoding UTF8 -ErrorAction Stop }
     catch { Write-Warning "Unable to write AntivirusLite log: $_" }
 }
@@ -182,13 +238,537 @@ function Get-SignalCount { param([int]$ProcessId)
 # ============================================================================
 # PROCESS ANCESTRY
 # ============================================================================
+function Initialize-FileEngine {
+    param([switch]$SkipAMSI)
+    # C# source is fixed. No downloaded executables, rules, or dynamic code.
+    if (-not ('AntivirusLiteFiles' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.ComponentModel;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using Microsoft.Win32.SafeHandles;
+public static class AntivirusLiteFiles {
+    [DllImport("amsi.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
+    public static extern int AmsiInitialize(string name, out IntPtr context);
+    [DllImport("amsi.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
+    public static extern int AmsiScanBuffer(IntPtr context, byte[] bytes, uint length, string name, IntPtr session, out int result);
+    [DllImport("amsi.dll", ExactSpelling=true)]
+    public static extern void AmsiUninitialize(IntPtr context);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileInfo {
+        public uint Attributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME Creation, Access, Write;
+        public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+    }
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInfo info);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern uint GetFinalPathNameByHandle(SafeFileHandle handle, StringBuilder path, uint size, uint flags);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int kind, ref byte info, uint size);
+    public static FileStream OpenForQuarantine(string path) {
+        // DELETE + GENERIC_READ; deny concurrent writers/renames. Open the link
+        // itself so reparse points can be rejected instead of followed.
+        SafeFileHandle h = CreateFile(path, 0x80010000, 1, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
+        if (h.IsInvalid) { h.Dispose(); throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        FileInfo i;
+        if (!GetFileInformationByHandle(h, out i)) { int e=Marshal.GetLastWin32Error(); h.Dispose(); throw new Win32Exception(e); }
+        if ((i.Attributes & (0x400 | 0x10)) != 0 || i.Links != 1) { h.Dispose(); throw new IOException("Links and directories are not quarantine candidates."); }
+        StringBuilder finalPath = new StringBuilder(32768);
+        uint size=GetFinalPathNameByHandle(h,finalPath,32768,0);
+        if (size==0 || size>=32768) { h.Dispose(); throw new IOException("Cannot verify the opened file path."); }
+        string resolved=finalPath.ToString();
+        if (resolved.StartsWith(@"\\?\")) resolved=resolved.Substring(4);
+        if (!String.Equals(resolved,Path.GetFullPath(path),StringComparison.OrdinalIgnoreCase)) {
+            h.Dispose(); throw new IOException("Opened path resolves through an alias or redirect.");
+        }
+        return new FileStream(h, FileAccess.Read);
+    }
+    public static void DeleteLockedSource(FileStream source) {
+        byte disposition = 1;
+        if (!SetFileInformationByHandle(source.SafeFileHandle, 4, ref disposition, 1))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+    public static string Hash(Stream source) {
+        source.Position=0;
+        using (SHA256 hash=SHA256.Create()) {
+            string value=BitConverter.ToString(hash.ComputeHash(source)).Replace("-", "");
+            source.Position=0; return value;
+        }
+    }
+    public static void Pack(Stream source, string target) {
+        source.Position=0;
+        using (FileStream file=new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        using (GZipStream zip=new GZipStream(file, CompressionMode.Compress)) { source.CopyTo(zip); }
+        source.Position=0;
+    }
+    public static void Unpack(string source, string target, long expectedLength, string expectedHash) {
+        if (expectedLength < 0 || expectedLength > 33554432) throw new IOException("Invalid payload size.");
+        bool created=false;
+        try {
+            using (FileStream input=File.OpenRead(source))
+            using (GZipStream zip=new GZipStream(input, CompressionMode.Decompress))
+            using (FileStream output=new FileStream(target, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None)) {
+                created=true;
+                byte[] buffer=new byte[65536]; long total=0; int count;
+                while ((count=zip.Read(buffer,0,buffer.Length))>0) {
+                    total+=count; if (total>expectedLength) throw new IOException("Payload exceeds recorded size.");
+                    output.Write(buffer,0,count);
+                }
+                if (total!=expectedLength || !String.Equals(Hash(output),expectedHash,StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("Payload integrity check failed.");
+            }
+        } catch { if (created) File.Delete(target); throw; }
+    }
+}
+'@ -ErrorAction Stop
+    }
+    if (-not $SkipAMSI -and -not $Script:AMSIAvailable) {
+        try {
+            $context = [IntPtr]::Zero
+            $hr = [AntivirusLiteFiles]::AmsiInitialize('Gorstak.AntivirusLite', [ref]$context)
+            if ($hr -lt 0 -or $context -eq [IntPtr]::Zero) { throw "AMSI initialization HRESULT=$hr" }
+            $Script:AMSIContext = $context
+            $Script:AMSIAvailable = $true
+        } catch {
+            Write-Warning "AMSI unavailable; file scans will report unknown, not clean: $_"
+        }
+    }
+}
+
+function Close-FileEngine {
+    if ($Script:AMSIAvailable) { [AntivirusLiteFiles]::AmsiUninitialize($Script:AMSIContext) }
+    $Script:AMSIAvailable = $false
+    $Script:AMSIContext = [IntPtr]::Zero
+}
+
+function Test-PathWithin {
+    param([string]$Path,[string]$Root)
+    if ([string]::IsNullOrWhiteSpace($Root)) { return $false }
+    $p = [IO.Path]::GetFullPath($Path)
+    $r = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar)
+    return $p.Equals($r,[StringComparison]::OrdinalIgnoreCase) -or
+        $p.StartsWith($r + [IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-NoReparsePath {
+    param([string]$Path)
+    $current = [IO.Path]::GetFullPath($Path)
+    while ($current) {
+        if (Test-Path -LiteralPath $current) {
+            if ((Get-Item -LiteralPath $current -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "Reparse points are not supported: $current"
+            }
+        }
+        $current = [IO.Path]::GetDirectoryName($current)
+    }
+}
+
+function Test-ProtectedFile {
+    param([string]$Path)
+    if (-not $Path -or -not [IO.Path]::IsPathRooted($Path)) { return $true }
+    if ($env:OS -eq 'Windows_NT' -and ($Path -notmatch '^[a-zA-Z]:\\' -or $Path.Substring(2).Contains(':'))) { return $true }
+    # Preserve Windows, installed software, this monitor, and shared script hosts.
+    foreach ($root in @($env:SystemRoot,$env:ProgramFiles,${env:ProgramFiles(x86)},$Script:InstallDirectory)) {
+        if (Test-PathWithin -Path $Path -Root $root) { return $true }
+    }
+    if ($PSCommandPath -and [string]::Equals([IO.Path]::GetFullPath($Path),[IO.Path]::GetFullPath($PSCommandPath),[StringComparison]::OrdinalIgnoreCase)) { return $true }
+    return [IO.Path]::GetFileName($Path) -in @('powershell.exe','pwsh.exe','cmd.exe','wscript.exe','cscript.exe','mshta.exe','rundll32.exe','regsvr32.exe','msiexec.exe')
+}
+
+function Set-PrivateStorageAcl {
+    param([string]$Path)
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true,$false)
+    $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+    foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+        $identity = New-Object Security.Principal.SecurityIdentifier($sid)
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($identity,'FullControl','ContainerInherit,ObjectInherit','None','Allow')))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+}
+
+function Initialize-Storage {
+    Assert-NoReparsePath -Path $Script:InstallDirectory
+    if (-not (Test-Path -LiteralPath $Script:InstallDirectory)) {
+        New-Item -ItemType Directory -Path $Script:InstallDirectory -ErrorAction Stop | Out-Null
+    }
+    Set-PrivateStorageAcl -Path $Script:InstallDirectory
+    # Reject pre-existing redirects before log/quarantine writes.
+    Assert-NoReparsePath -Path $Script:LogPath
+    if (-not $Script:AuditOnly) {
+        Assert-NoReparsePath -Path $Script:QuarantineDirectory
+        if (-not (Test-Path -LiteralPath $Script:QuarantineDirectory)) {
+            New-Item -ItemType Directory -Path $Script:QuarantineDirectory -ErrorAction Stop | Out-Null
+        }
+        Set-PrivateStorageAcl -Path $Script:QuarantineDirectory
+    }
+}
+
+function Write-QuarantineRecord {
+    param([string]$Id,[object]$Record)
+    if ($Id -notmatch '^[a-fA-F0-9]{32}$') { throw 'Invalid quarantine ID.' }
+    $path = Join-Path $Script:QuarantineDirectory ($Id + '.json')
+    $temp = Join-Path $Script:QuarantineDirectory (([guid]::NewGuid().ToString('N')) + '.tmp')
+    try {
+        [IO.File]::WriteAllText($temp,($Record | ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))
+        if ([IO.File]::Exists($path)) { [IO.File]::Replace($temp,$path,[NullString]::Value) }
+        else { [IO.File]::Move($temp,$path) }
+    } finally { if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) } }
+}
+
+function Move-ToQuarantine {
+    param([string]$Path,[string]$Hash,[string]$Reason)
+    # Only content-backed verdicts reach here. A heuristic process alert never
+    # authorizes moving its executable (which might be a legitimate host).
+    if ($Script:AuditOnly) { return $false }
+    if (Test-ProtectedFile -Path $Path) { return $false }
+    Assert-NoReparsePath -Path $Path
+    Assert-NoReparsePath -Path $Script:QuarantineDirectory
+    $id = [guid]::NewGuid().ToString('N')
+    $payload = Join-Path $Script:QuarantineDirectory ($id + '.quarantine')
+    $source = $null
+    $recordSaved = $false
+    try {
+        $source = [AntivirusLiteFiles]::OpenForQuarantine($Path)
+        if ($source.Length -gt $Script:MaxScanBytes) { throw 'File exceeds quarantine size limit.' }
+        if ([AntivirusLiteFiles]::Hash($source) -ne $Hash) { throw 'File changed after detection; no removal performed.' }
+        [AntivirusLiteFiles]::Pack($source,$payload)
+        # Verify the archive before authorizing deletion of the locked source.
+        $verify = Join-Path $Script:QuarantineDirectory ($id + '.verify')
+        try { [AntivirusLiteFiles]::Unpack($payload,$verify,$source.Length,$Hash) }
+        finally { if ([IO.File]::Exists($verify)) { [IO.File]::Delete($verify) } }
+        $record = [ordered]@{ schema=1; id=$id; originalPath=[IO.Path]::GetFullPath($Path); sha256=$Hash;
+            length=$source.Length; reason=$Reason; timeUtc=[datetime]::UtcNow.ToString('o'); state='Copied'; format='gzip' }
+        Write-QuarantineRecord -Id $id -Record $record
+        $recordSaved = $true
+        [AntivirusLiteFiles]::DeleteLockedSource($source)
+        $source.Dispose(); $source = $null
+        $record.state = 'Quarantined'
+        Write-QuarantineRecord -Id $id -Record $record
+        Log-Event -Type 'response' -Rule 'Quarantine' -Evidence $Path -Reasoning $Reason -Conf 1 -Tier 'Response' -Meta @{id=$id; sha256=$Hash}
+        return $true
+    } catch {
+        Log-Event -Type 'system' -Rule 'QuarantineFailed' -Evidence $Path -Reasoning ([string]$_) -Conf 1 -Tier 'System' -Meta @{id=$id; recoveryRecord=$recordSaved}
+        Write-Warning "Quarantine failed for ${Path}: $_"
+        # Never report a copy/locked file as isolated. Retain a durable record
+        # if source removal failed; the third-party AV may have won the race.
+        if (-not $recordSaved -and [IO.File]::Exists($payload)) { [IO.File]::Delete($payload) }
+        return $false
+    } finally { if ($source) { $source.Dispose() } }
+}
+
+function Get-QuarantineRecords {
+    if (-not (Test-Path -LiteralPath $Script:QuarantineDirectory)) { return }
+    Assert-NoReparsePath -Path $Script:QuarantineDirectory
+    foreach ($file in Get-ChildItem -LiteralPath $Script:QuarantineDirectory -Filter '*.json' -File) {
+        Assert-NoReparsePath -Path $file.FullName
+        try { Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+        catch { Write-Warning "Unreadable quarantine record $($file.Name): $_" }
+    }
+}
+
+function Restore-QuarantineFile {
+    param([string]$Id,[string]$Destination)
+    if ($Id -notmatch '^[a-fA-F0-9]{32}$') { throw 'Invalid quarantine ID.' }
+    if (-not [IO.Path]::IsPathRooted($Destination)) { throw 'RestorePath must be absolute.' }
+    $Destination = [IO.Path]::GetFullPath($Destination)
+    if (Test-ProtectedFile -Path $Destination) { throw 'Restore to a user-controlled location outside Windows, Program Files, or monitor storage.' }
+    Assert-NoReparsePath -Path $Destination
+    Assert-NoReparsePath -Path $Script:QuarantineDirectory
+    $metadata = Join-Path $Script:QuarantineDirectory ($Id + '.json')
+    $payload = Join-Path $Script:QuarantineDirectory ($Id + '.quarantine')
+    Assert-NoReparsePath -Path $metadata
+    Assert-NoReparsePath -Path $payload
+    $record = Get-Content -LiteralPath $metadata -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($record.id -ne $Id -or $record.schema -ne 1 -or $record.format -ne 'gzip' -or
+        $record.sha256 -notmatch '^[a-fA-F0-9]{64}$' -or $record.state -notin @('Quarantined','Copied','Restored')) { throw 'Invalid quarantine metadata.' }
+    $parent = [IO.Path]::GetDirectoryName($Destination)
+    if (-not [IO.Directory]::Exists($parent)) { throw 'Restore destination directory must already exist.' }
+    if (Test-Path -LiteralPath $Destination) { throw 'Restore never overwrites an existing file.' }
+    # Verify inside protected storage before making bytes available at destination.
+    $temp = Join-Path $Script:QuarantineDirectory (([guid]::NewGuid().ToString('N')) + '.restore')
+    try {
+        [AntivirusLiteFiles]::Unpack($payload,$temp,[long]$record.length,$record.sha256)
+        # Publish only a complete copy; never overwrite a concurrent file.
+        $staged = Join-Path $parent (([guid]::NewGuid().ToString('N')) + '.restoring')
+        $output = [IO.File]::Open($staged,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        try {
+            $input = [IO.File]::OpenRead($temp)
+            try { $input.CopyTo($output) } finally { $input.Dispose() }
+        } finally { $output.Dispose() }
+        [IO.File]::Move($staged,$Destination)
+        $record.state = 'Restored'
+        $record | Add-Member -NotePropertyName restoredPath -NotePropertyValue $Destination -Force
+        Write-QuarantineRecord -Id $Id -Record $record
+        Log-Event -Type 'response' -Rule 'Restore' -Evidence $Destination -Reasoning 'Explicit administrator restore; archive retained' -Conf 1 -Tier 'Response' -Meta @{id=$Id}
+    } finally {
+        if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
+        if ($staged -and [IO.File]::Exists($staged)) { [IO.File]::Delete($staged) }
+    }
+}
+
+function Get-ContentVerdict {
+    param([string]$Path)
+    Assert-NoReparsePath -Path $Path
+    $file = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($file.PSIsContainer -or $file.Length -gt $Script:MaxScanBytes) {
+        return [pscustomobject]@{ Path=$Path; Verdict='Skipped'; Hash=''; Reason='Not a regular file or exceeds 32 MiB' }
+    }
+    $stream = [IO.File]::Open($file.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        $hash = [AntivirusLiteFiles]::Hash($stream)
+        if ($Script:FileVerdicts.ContainsKey($hash)) {
+            $cached = $Script:FileVerdicts[$hash]
+            if (([datetime]::UtcNow - $cached.Time).TotalMinutes -lt 5) {
+                return [pscustomobject]@{ Path=$file.FullName; Verdict=$cached.Verdict; Hash=$hash; Reason=$cached.Reason }
+            }
+        }
+        $verdict = 'Unknown'; $reasons = @()
+        if ($Script:AMSIAvailable) {
+            $bytes = New-Object byte[] ([int]$stream.Length)
+            $offset = 0
+            while ($offset -lt $bytes.Length) {
+                $read = $stream.Read($bytes,$offset,($bytes.Length-$offset))
+                if (-not $read) { throw 'Short read while scanning file.' }
+                $offset += $read
+            }
+            $result = 0
+            $hr = [AntivirusLiteFiles]::AmsiScanBuffer($Script:AMSIContext,$bytes,[uint32]$bytes.Length,$file.FullName,[IntPtr]::Zero,[ref]$result)
+            if ($hr -lt 0) { $reasons += "AMSI failed HRESULT=$hr" }
+            elseif ($result -ge 32768) { $verdict='Malicious'; $reasons += 'AMSI malware verdict' }
+            elseif ($result -ge 16384) { $verdict='Blocked'; $reasons += 'AMSI administrator policy block; not a malware verdict' }
+            else { $reasons += 'AMSI returned no detection; not proof of safety' }
+        } else { $reasons += 'AMSI unavailable' }
+        if ($verdict -ne 'Malicious') {
+            $rep = Test-HashReputation -Hash $hash
+            if ($rep.Bad) { $verdict='Malicious' }
+            $reasons += "$($rep.Src): $($rep.Detail)"
+        }
+        if ($Script:FileVerdicts.Count -ge 4096) { $Script:FileVerdicts.Clear() }
+        $reason = $reasons -join '; '
+        $Script:FileVerdicts[$hash] = @{ Time=[datetime]::UtcNow; Verdict=$verdict; Reason=$reason }
+        return [pscustomobject]@{ Path=$file.FullName; Verdict=$verdict; Hash=$hash; Reason=$reason }
+    } finally { $stream.Dispose() }
+}
+
+function Invoke-FileVerdict {
+    param([string]$Path)
+    try {
+        $result = Get-ContentVerdict -Path $Path
+        if ($result.Verdict -in @('Malicious','Blocked')) {
+            Log-Event -Type 'detection' -Rule 'FileVerdict' -Evidence $result.Path -Reasoning $result.Reason -Conf 1 -Tier 'Content' -Meta @{sha256=$result.Hash; verdict=$result.Verdict; responseMode=$Script:ResponseMode; audit=$Script:AuditOnly}
+            if ($result.Verdict -eq 'Malicious' -and -not $Script:AuditOnly) {
+                $isolated = Move-ToQuarantine -Path $result.Path -Hash $result.Hash -Reason $result.Reason
+                $result | Add-Member -NotePropertyName Quarantined -NotePropertyValue $isolated
+            }
+        }
+        return $result
+    } catch {
+        # Files may vanish because another AV has already remediated them.
+        Log-Event -Type 'system' -Rule 'FileScanUnavailable' -Evidence $Path -Reasoning ([string]$_) -Conf 1 -Tier 'System'
+        return [pscustomobject]@{ Path=$Path; Verdict='Unavailable'; Hash=''; Reason=[string]$_ }
+    }
+}
+
+function Add-PendingFile {
+    param([string]$Path)
+    if ([IO.Path]::GetExtension($Path) -notin $Script:ScanExtensions) { return }
+    if (Test-PathWithin -Path $Path -Root $Script:InstallDirectory) { return }
+    if (Test-ProtectedFile -Path $Path) { return }
+    if ($Script:PendingFiles.Count -ge 2048) {
+        if (-not (Is-Dup -K 'FileScanQueueFull' -TTL 60)) {
+            Log-Event -Type 'system' -Rule 'FileScanQueueFull' -Evidence '2048 pending files' -Reasoning 'New candidates dropped; use ScanPath for a complete scan' -Conf 1 -Tier 'System'
+        }
+        return
+    }
+    if ($Script:PendingFileSet.Add($Path)) { $Script:PendingFiles.Enqueue($Path) }
+}
+
+function Invoke-PendingFileScans {
+    # Bound network latency and memory per monitor cycle; AMSI scans <=32 MiB.
+    for ($count=0; $count -lt 2 -and $Script:PendingFiles.Count -gt 0; $count++) {
+        $path = $Script:PendingFiles.Dequeue()
+        $null = $Script:PendingFileSet.Remove($path)
+        $null = Invoke-FileVerdict -Path $path
+    }
+}
+
+function Invoke-PathScan {
+    param([string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    Assert-NoReparsePath -Path $full
+    if (-not (Test-Path -LiteralPath $full)) { throw 'Scan path does not exist.' }
+    $directories = New-Object 'System.Collections.Generic.Queue[string]'
+    $stats = @{ Scanned=0; Malicious=0; Blocked=0; Unknown=0; Unavailable=0; Skipped=0 }
+    $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if ($item.PSIsContainer) { $directories.Enqueue($full) } else {
+        $result = Invoke-FileVerdict -Path $full
+        $stats.Scanned++; $stats[$result.Verdict]++
+        Write-Output $result
+    }
+    while ($directories.Count -gt 0) {
+        $dir = $directories.Dequeue()
+        try {
+            Assert-NoReparsePath -Path $dir
+            foreach ($entry in Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop) {
+                if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { $stats.Skipped++; continue }
+                if (Test-PathWithin -Path $entry.FullName -Root $Script:InstallDirectory) { $stats.Skipped++; continue }
+                if ($entry.PSIsContainer) { $directories.Enqueue($entry.FullName) }
+                elseif ($entry.Extension -in $Script:ScanExtensions) {
+                    $result = Invoke-FileVerdict -Path $entry.FullName
+                    $stats.Scanned++; $stats[$result.Verdict]++
+                    Write-Output $result
+                } else { $stats.Skipped++ }
+            }
+        } catch { $stats.Unavailable++; Write-Warning "Cannot enumerate ${dir}: $_" }
+    }
+    Write-Host ("Scan summary: " + ($stats | ConvertTo-Json -Compress))
+    if ($stats.Scanned -eq 0) { Write-Warning 'No eligible files scanned.' }
+}
+
+function Test-AutorunCommand {
+    param([string]$Command)
+    # Shell use alone is common. Require a staging location, remote URL, or
+    # encoded/download-and-execute pattern before emitting an inventory alert.
+    return $Command -match '(?i)https?://|\\(?:AppData|Temp|Downloads)\\|-(?:enc|encodedcommand)\s+[A-Za-z0-9+/=]{40,}|downloadstring|invoke-expression'
+}
+
+function Invoke-PersistenceInventory {
+    $keys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce')
+    foreach ($key in $keys) {
+        if (-not (Test-Path -LiteralPath $key)) { continue }
+        $values = Get-ItemProperty -LiteralPath $key -ErrorAction Stop
+        foreach ($property in $values.PSObject.Properties) {
+            if ($property.Name -like 'PS*' -or $property.Value -isnot [string]) { continue }
+            if ((Test-AutorunCommand -Command $property.Value) -and -not (Is-Dup -K "Autorun|$key|$($property.Name)|$($property.Value)" -TTL 1800)) {
+                Log-Event -Type 'detection' -Rule 'RegistryAutorun' -Evidence "$key : $($property.Name) = $($property.Value)" -Reasoning 'Review suspicious autorun; no modification performed' -Conf 0.65 -Tier 'Inventory'
+            }
+        }
+    }
+    foreach ($task in Get-ScheduledTask -ErrorAction Stop) {
+        foreach ($action in $task.Actions) {
+            $command = "$($action.Execute) $($action.Arguments)"
+            if ((Test-AutorunCommand -Command $command) -and -not (Is-Dup -K "Task|$($task.TaskPath)|$($task.TaskName)|$command" -TTL 1800)) {
+                Log-Event -Type 'detection' -Rule 'ScheduledAutorun' -Evidence "$($task.TaskPath)$($task.TaskName) : $command" -Reasoning 'Review suspicious scheduled action; task retained' -Conf 0.65 -Tier 'Inventory'
+            }
+        }
+    }
+}
+
+function Invoke-SecurityPosture {
+    # Observe state and changes. Never enable/disable another security product.
+    $snapshot = @{}
+    foreach ($profile in Get-NetFirewallProfile -ErrorAction Stop) {
+        $snapshot['Firewall.' + $profile.Name] = [string]$profile.Enabled
+    }
+    foreach ($service in Get-CimInstance Win32_Service -Property Name,PathName,StartMode -ErrorAction Stop) {
+        $snapshot['Service.' + $service.Name] = "$($service.PathName)|$($service.StartMode)"
+    }
+    foreach ($key in $snapshot.Keys) {
+        $changed = $Script:SecurityBaseline.ContainsKey($key) -and $Script:SecurityBaseline[$key] -ne $snapshot[$key]
+        $newService = $Script:SecurityBaseline.Count -gt 0 -and $key -like 'Service.*' -and -not $Script:SecurityBaseline.ContainsKey($key)
+        $disabledFirewall = $key -like 'Firewall.*' -and $snapshot[$key] -eq 'False'
+        if (($changed -or $newService -or $disabledFirewall) -and -not (Is-Dup -K "Posture|$key|$($snapshot[$key])" -TTL 1800)) {
+            Log-Event -Type 'detection' -Rule 'SecurityPosture' -Evidence "$key = $($snapshot[$key])" -Reasoning 'Configuration change or disabled firewall; review with the installed security product' -Conf 0.6 -Tier 'Inventory' -Meta @{previous=$Script:SecurityBaseline[$key]}
+        }
+    }
+    $Script:SecurityBaseline = $snapshot
+}
+
+function Invoke-SecurityEvents {
+    $channels = @(
+        @{ Name='System'; Ids=@(104,7045) },
+        @{ Name='Security'; Ids=@(1102) },
+        @{ Name='Microsoft-Windows-Windows Defender/Operational'; Ids=@(1116,1117) }
+    )
+    foreach ($channel in $channels) {
+        $end = Get-Date
+        $start = if ($Script:EventWatermarks.ContainsKey($channel.Name)) { $Script:EventWatermarks[$channel.Name].AddSeconds(-1) } else { $end.AddMinutes(-5) }
+        try {
+            $events = @(Get-WinEvent -FilterHashtable @{LogName=$channel.Name;Id=$channel.Ids;StartTime=$start;EndTime=$end} -MaxEvents 100 -ErrorAction Stop)
+            if ($events.Count -eq 100) {
+                Log-Event -Type 'system' -Rule 'EventScanLimit' -Evidence $channel.Name -Reasoning '100-event limit reached; older events in this interval may be omitted' -Conf 1 -Tier 'System'
+            }
+            foreach ($eventRecord in $events) {
+                $key = "Event|$($channel.Name)|$($eventRecord.RecordId)|$($eventRecord.TimeCreated.Ticks)"
+                if (Is-Dup -K $key -TTL 600) { continue }
+                Log-Event -Type 'observation' -Rule 'WindowsSecurityEvent' -Evidence "$($channel.Name): event $($eventRecord.Id), provider $($eventRecord.ProviderName)" -Reasoning 'Security log clear, service install, or Defender detection/action; no duplicate remediation' -Conf 1 -Tier 'ExternalTelemetry' -Meta @{channel=$channel.Name; eventId=$eventRecord.Id; recordId=$eventRecord.RecordId; eventTime=$eventRecord.TimeCreated.ToUniversalTime().ToString('o')}
+            }
+            $Script:EventWatermarks[$channel.Name] = $end
+        } catch {
+            if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $Script:EventWatermarks[$channel.Name]=$end; continue }
+            if (-not (Is-Dup -K ('EventAccess|' + $channel.Name) -TTL 1800)) {
+                Log-Event -Type 'system' -Rule 'EventLogUnavailable' -Evidence $channel.Name -Reasoning 'Channel unavailable or inaccessible; other telemetry continues' -Conf 1 -Tier 'System'
+            }
+        }
+    }
+}
+
+function Write-HealthHeartbeat {
+    $stages = @{}
+    foreach ($key in $Script:StageHealth.Keys) { $stages[$key] = $Script:StageHealth[$key] }
+    $process = [Diagnostics.Process]::GetCurrentProcess()
+    try {
+        Log-Event -Type 'system' -Rule 'Health' -Evidence "AntivirusLite v$Script:Version" -Reasoning 'Periodic health snapshot; capability availability is not detection coverage' -Conf 1 -Tier 'System' -Meta @{
+            mode=$Script:ResponseMode; observeOnly=$Script:AuditOnly; amsi=$Script:AMSIAvailable;
+            noNetwork=$Script:Offline; queuedFiles=$Script:PendingFiles.Count;
+            watchers=$Script:FileWatchers.Count; workingSetMB=[Math]::Round($process.WorkingSet64/1MB);
+            stages=$stages; circuits=$Script:CircuitBreakers
+        }
+    } finally { $process.Dispose() }
+}
+
+function Invoke-LocalSelfTest {
+    # Benign local bytes only. Does not install a task, emit EICAR, or invoke
+    # quarantine/remediation. AMSI no-detection is not labeled "AV works".
+    $results = New-Object 'System.Collections.Generic.List[object]'
+    $temp = Join-Path $Script:InstallDirectory ([guid]::NewGuid().ToString('N'))
+    $memory = [IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes('AntivirusLite benign archive round-trip'))
+    try {
+        $hash = [AntivirusLiteFiles]::Hash($memory)
+        [AntivirusLiteFiles]::Pack($memory,($temp + '.quarantine'))
+        [AntivirusLiteFiles]::Unpack(($temp + '.quarantine'),($temp + '.out'),$memory.Length,$hash)
+        $results.Add([pscustomobject]@{Check='Archive SHA-256 round trip';Status='Pass'})
+    } finally {
+        $memory.Dispose()
+        foreach ($suffix in @('.quarantine','.out')) { if ([IO.File]::Exists($temp+$suffix)) { [IO.File]::Delete($temp+$suffix) } }
+    }
+    $results.Add([pscustomobject]@{Check='AMSI initialization';Status=$(if ($Script:AMSIAvailable) {'Pass'} else {'Unavailable'})})
+    foreach ($check in @(
+        @{ Name='Process telemetry'; Action={ $null=Get-CimInstance Win32_Process -Property ProcessId -ErrorAction Stop | Select-Object -First 1 } },
+        @{ Name='Scheduled tasks'; Action={ $null=Get-ScheduledTask -ErrorAction Stop | Select-Object -First 1 } },
+        @{ Name='Firewall telemetry'; Action={ $null=Get-NetFirewallProfile -ErrorAction Stop } }
+    )) {
+        try { & $check.Action; $results.Add([pscustomobject]@{Check=$check.Name;Status='Pass'}) }
+        catch { $results.Add([pscustomobject]@{Check=$check.Name;Status='Unavailable';Detail=[string]$_}) }
+    }
+    # Client editions may expose third-party AV registrations here. Their raw
+    # productState is deliberately not decoded into an unsupported health claim.
+    try {
+        $products = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop | Select-Object -ExpandProperty displayName)
+        $results.Add([pscustomobject]@{Check='Registered AV products (inventory only)';Status='Info';Detail=($products -join '; ')})
+    } catch { $results.Add([pscustomobject]@{Check='Security Center inventory';Status='Unavailable';Detail='May be absent on Windows Server'}) }
+    $results
+}
+
 function Update-Ancestry {
     $s = @{}
     try {
         Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,ExecutablePath,CreationDate -ErrorAction Stop | ForEach-Object {
             $s[$_.ProcessId] = @{ N=$_.Name; PP=$_.ParentProcessId; CL=$_.CommandLine; P=$_.ExecutablePath; T=$_.CreationDate }
         }
-    } catch {}
+    } catch { throw "Process snapshot failed; previous state retained: $_" }
     foreach ($processKey in @($Script:ProcessAncestry.Keys)) {
         if (-not $s.ContainsKey($processKey) -or
             $s[$processKey].T -ne $Script:ProcessAncestry[$processKey].T) {
@@ -214,30 +794,60 @@ function Get-Entropy { param([string]$S)
 # ============================================================================
 # HASH REPUTATION (Live API - like AV.ps1 approach)
 # ============================================================================
+function Test-CircuitAvailable {
+    param([string]$Service)
+    $circuit = $Script:CircuitBreakers[$Service]
+    return -not $circuit -or $circuit.Failures -lt 3 -or [datetime]::UtcNow -ge $circuit.RetryAfter
+}
+
+function Set-CircuitOutcome {
+    param([string]$Service,[bool]$Success)
+    if ($Success) { $Script:CircuitBreakers.Remove($Service); return }
+    if (-not $Script:CircuitBreakers.ContainsKey($Service)) {
+        $Script:CircuitBreakers[$Service] = @{ Failures=0; RetryAfter=[datetime]::MinValue }
+    }
+    $entry = $Script:CircuitBreakers[$Service]
+    $entry.Failures++
+    if ($entry.Failures -ge 3) { $entry.RetryAfter = [datetime]::UtcNow.AddMinutes(5) }
+}
+
 function Test-HashReputation { param([string]$Hash)
-    if ($Script:HashCache.ContainsKey($Hash)) { return $Script:HashCache[$Hash] }
-
-    # CIRCL hashlookup - known good
-    try {
-        $r = Invoke-RestMethod -Uri "https://hashlookup.circl.lu/lookup/sha256/$Hash" -Method Get -TimeoutSec 6 -ErrorAction Stop
-        if ($r.'hashlookup:trust' -and [int]$r.'hashlookup:trust' -gt 50) {
-            $Script:HashCache[$Hash] = @{ Bad=$false; Src="CIRCL"; Detail="Trust=$($r.'hashlookup:trust')" }
-            return $Script:HashCache[$Hash]
+    if ($Hash -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid SHA-256.' }
+    if ($Script:Offline) { return @{ Bad=$false; Src='Offline'; Detail='External reputation disabled' } }
+    if ($Script:HashCache.ContainsKey($Hash) -and
+        ([datetime]::UtcNow - $Script:HashCache[$Hash].Time).TotalMinutes -lt 5) { return $Script:HashCache[$Hash] }
+    $verdict = @{ Bad=$false; Src='Unknown'; Detail='No verdict; unknown hash or lookup unavailable'; Time=[datetime]::UtcNow }
+    # Known-malicious evidence takes precedence over a known-file lookup.
+    if ($env:SENTINEL_ABUSECH_AUTH_KEY -and (Test-CircuitAvailable -Service 'MalwareBazaar')) {
+        try {
+            $r = Invoke-RestMethod -Uri 'https://mb-api.abuse.ch/api/v1/' -Method Post -Body @{query='get_info';hash=$Hash} -Headers @{'Auth-Key'=$env:SENTINEL_ABUSECH_AUTH_KEY} -ContentType 'application/x-www-form-urlencoded' -TimeoutSec 4 -ErrorAction Stop
+            Set-CircuitOutcome -Service 'MalwareBazaar' -Success $true
+            $match = @($r.data | Where-Object { $_.sha256_hash -eq $Hash })
+            if ($r.query_status -eq 'ok' -and $match.Count -gt 0) {
+                $verdict.Bad=$true; $verdict.Src='MalwareBazaar'; $verdict.Detail='Exact SHA-256 malware match'
+            }
+        } catch {
+            Set-CircuitOutcome -Service 'MalwareBazaar' -Success $false
+            if (-not (Is-Dup -K 'ReputationUnavailable' -TTL 300)) {
+                Log-Event -Type 'system' -Rule 'ReputationUnavailable' -Evidence 'MalwareBazaar lookup failed' -Reasoning 'No verdict; AMSI and behavioral scanning continue' -Conf 1 -Tier 'System'
+            }
         }
-    } catch {}
-
-    # MalwareBazaar - known bad
-    try {
-        if (-not $env:SENTINEL_ABUSECH_AUTH_KEY) { throw 'Optional MalwareBazaar authentication is not configured.' }
-        $body = @{ query='get_info'; hash=$Hash }
-        $r = Invoke-RestMethod -Uri "https://mb-api.abuse.ch/api/v1/" -Method Post -Body $body -Headers @{'Auth-Key'=$env:SENTINEL_ABUSECH_AUTH_KEY} -ContentType 'application/x-www-form-urlencoded' -TimeoutSec 8 -ErrorAction Stop
-        if ($r.query_status -eq "ok" -or $r.query_status -eq "hash_found") {
-            $Script:HashCache[$Hash] = @{ Bad=$true; Src="MalwareBazaar"; Detail="Known malware" }
-            return $Script:HashCache[$Hash]
+    }
+    if (-not $verdict.Bad -and (Test-CircuitAvailable -Service 'CIRCL')) {
+        try {
+            $r = Invoke-RestMethod -Uri "https://hashlookup.circl.lu/lookup/sha256/$Hash" -Method Get -TimeoutSec 4 -ErrorAction Stop
+            Set-CircuitOutcome -Service 'CIRCL' -Success $true
+            if ($r.'SHA-256' -eq $Hash) {
+                $verdict.Src='CIRCL'; $verdict.Detail='Known file; not an allowlist or proof of safety'
+            }
+        } catch {
+            # A missing hash is a successful lookup with no verdict, not outage.
+            $notFound = $_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404
+            Set-CircuitOutcome -Service 'CIRCL' -Success ([bool]$notFound)
         }
-    } catch {}
-
-    $Script:HashCache[$Hash] = @{ Bad=$false; Src="Unknown"; Detail="No verdict; unknown hash or lookup unavailable" }
+    }
+    if ($Script:HashCache.Count -ge 4096) { $Script:HashCache.Clear() }
+    $Script:HashCache[$Hash] = $verdict
     return $Script:HashCache[$Hash]
 }
 
@@ -425,11 +1035,15 @@ function Test-Persistence { param([string]$CL,[int]$ProcessId,[string]$N)
 # ============================================================================
 function Test-Execution { param([string]$CL,[int]$ProcessId,[string]$N)
     if ([string]::IsNullOrEmpty($CL)) { return $null }
-    # Large encoded payload (structural: -enc + base64 block)
-    if ($CL -match '-[eE][nN][cC]\w*\s+[A-Za-z0-9+/=]{100,}') {
-        return @{ Rule="EncodedExec"; Evidence="Encoded payload ($([Math]::Round($CL.Length/1024,1))KB) (PID $ProcessId)"; Reasoning="Encoded command line; also used by legitimate automation"; Conf=0.70; Tier="Tier2Indicator"; Cat="execution" }
-    }
+    $CL = Get-InspectedCommandLine -CommandLine $CL
     $c = $CL.ToLower()
+    # A TCP stream is normal client behavior. Require command execution and
+    # bidirectional stream use before classifying a PowerShell socket shell.
+    if ($c -match 'net\.sockets\.tcpclient|system\.net\.sockets' -and
+        $c -match 'getstream|networkstream' -and $c -match '\.read\s*\(' -and
+        $c -match '\.write\s*\(' -and $c -match '\biex\b|invoke-expression|redirectstandardinput|redirectstandardoutput') {
+        return @{ Rule='ReverseShell'; Evidence="Socket command loop (PID $ProcessId)"; Reasoning='Socket reads and writes combined with command execution or redirected shell I/O'; Conf=0.92; Tier='Tier1Behavioral'; Cat='c2' }
+    }
     # Download + execute (structural .NET APIs)
     if (($c -match 'downloadstring|downloadfile|downloaddata|invoke-webrequest') -and ($c -match 'invoke-expression|iex\s|start-process|\.invoke\(')) {
         return @{ Rule="DownloadExec"; Evidence="Download-and-execute (PID $ProcessId)"; Reasoning="Downloading and immediately executing remote content"; Conf=0.87; Tier="Tier1Behavioral"; Cat="execution" }
@@ -438,13 +1052,40 @@ function Test-Execution { param([string]$CL,[int]$ProcessId,[string]$N)
     if ($c -match 'reflection\.assembly.*load|gettype.*getmethod.*invoke|\[convert\]::frombase64.*load') {
         return @{ Rule="ReflectiveLoad"; Evidence="Reflective assembly load (PID $ProcessId)"; Reasoning="In-memory code loading via .NET reflection"; Conf=0.88; Tier="Tier1Behavioral"; Cat="execution" }
     }
-    # Raw socket shell (structural: TCPClient + Stream)
-    if ($c -match 'net\.sockets\.tcpclient|system\.net\.sockets' -and $c -match 'getstream|networkstream') {
-        return @{ Rule="ReverseShell"; Evidence="Socket shell (PID $ProcessId)"; Reasoning="Building network stream shell via .NET socket APIs"; Conf=0.92; Tier="Tier1Behavioral"; Cat="c2" }
+    # Encoded execution remains a weak indicator unless decoded content above
+    # supplies stronger evidence. Decoding never invokes the supplied text.
+    if ($CL -match '(?i)-(?:enc|encodedcommand)\s+[A-Za-z0-9+/=]{100,}') {
+        return @{ Rule='EncodedExec'; Evidence="Encoded payload (PID $ProcessId)"; Reasoning='Encoded command line; also used by legitimate automation'; Conf=0.70; Tier='Tier2Indicator'; Cat='execution' }
     }
     # Execution policy bypass + hidden window (staging pattern)
     if ($c -match '-executionpolicy\s*(bypass|unrestricted)' -and $c -match '-w(indowstyle)?\s*h(idden)?') {
         return @{ Rule="HiddenExec"; Evidence="Hidden+bypass execution (PID $ProcessId)"; Reasoning="PowerShell running hidden with policy bypass"; Conf=0.72; Tier="Tier2Indicator"; Cat="execution" }
+    }
+    return $null
+}
+
+function Get-InspectedCommandLine {
+    param([string]$CommandLine)
+    # PowerShell -EncodedCommand uses UTF-16LE. Limit decoding work and do not
+    # recursively unpack/execute anything. Retain the original for other rules.
+    if ($CommandLine -and
+        $CommandLine -match '(?i)(?:^|\s)-(?:e|en|enc|enco|encod|encode|encoded|encodedc|encodedco|encodedcom|encodedcomm|encodedcomma|encodedcomman|encodedcommand)\s+["'']?([A-Za-z0-9+/=]{8,65536})(?=["''\s]|$)') {
+        try {
+            $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1]))
+            return $CommandLine + "`n[DecodedCommand]`n" + $decoded
+        } catch { }
+    }
+    return $CommandLine
+}
+
+function Get-PowerShellPayloadPath {
+    param([string]$Name,[string]$CommandLine)
+    if ($Name -notin @('powershell.exe','pwsh.exe')) { return $null }
+    # Only an explicit absolute -File argument. Do not guess paths from -Command,
+    # relative working directories, or strings embedded inside the script body.
+    if ($CommandLine -match '(?i)(?:^|\s)-File\s+(?:"([^"]+)"|''([^'']+)''|(\S+))') {
+        $path = if ($Matches[1]) { $Matches[1] } elseif ($Matches[2]) { $Matches[2] } else { $Matches[3] }
+        if ([IO.Path]::IsPathRooted($path) -and [IO.Path]::GetExtension($path) -in @('.ps1','.psm1')) { return $path }
     }
     return $null
 }
@@ -810,12 +1451,8 @@ function Test-UnsignedStaged { param([int]$ProcessId,[string]$Name,[string]$Path
         $sig = Get-AuthenticodeSignature -FilePath $Path -ErrorAction Stop
         if ($sig.Status -ne 'Valid') {
             $conf = 0.68
-            # Hash reputation boost
-            try {
-                $hash = (Get-FileHash -Path $Path -Algorithm SHA256 -ErrorAction Stop).Hash
-                $rep = Test-HashReputation -Hash $hash
-                if ($rep -and $rep.Bad) { $conf = 0.92 }
-            } catch {}
+            # Content/reputation scans run through the bounded file queue, not
+            # once per process in this hot loop. Unsigned alone is not malware.
             return @{ Rule="UnsignedStaged"; Evidence="$Name (PID $ProcessId) unsigned from $Path"; Reasoning="Unsigned binary executing from staging location"; Conf=$conf; Tier="Tier2Indicator"; Cat="unsigned" }
         }
     } catch {}
@@ -863,7 +1500,7 @@ function Test-Genealogy { param([int]$ProcessId,[string]$Name,[int]$PPid)
 # ============================================================================
 function Test-WmiPersistence {
     try {
-        Get-WmiObject -Namespace "root\subscription" -Class "CommandLineEventConsumer" -ErrorAction Stop | ForEach-Object {
+        Get-CimInstance -Namespace "root\subscription" -ClassName "CommandLineEventConsumer" -ErrorAction Stop | ForEach-Object {
             $dk = "WMI|$($_.Name)"
             if (-not (Is-Dup -K $dk -TTL 600)) {
                 Log-Event -Type "detection" -Rule "WmiPersistence" -Evidence "WMI consumer: $($_.Name) -> $($_.CommandLineTemplate)" `
@@ -943,6 +1580,7 @@ function Invoke-FileAnalysis {
     foreach ($e in $evts) {
         $ext = [System.IO.Path]::GetExtension($e.P)
         if ($ext -in $Script:RansomExts) { $ransomHits++ }
+        Add-PendingFile -Path $e.P
     }
 
     $Script:FileRateTracker.Count += $evts.Count
@@ -1052,6 +1690,13 @@ function Invoke-Composite { param([int]$ProcessId,[string]$Name)
 function Invoke-Kill { param([int]$ProcessId,[string]$Name,[string]$Rule,[double]$Conf)
     if ($ProcessId -le 4 -or $ProcessId -eq $PID) { return }
     if ($Conf -lt 0.85) { return }
+    if ($Script:AuditOnly) {
+        if (-not (Is-Dup -K "ObserveResponse|$ProcessId|$Rule" -TTL 120)) {
+            Log-Event -Type 'observation' -Rule $Rule -Evidence "Would terminate $Name (PID $ProcessId) in Standalone mode" -Reasoning 'Companion/audit mode leaves response to the installed AV/EDR' -Conf $Conf -Tier 'ResponseSuppressed'
+        }
+        return
+    }
+    $target = $null
     try {
         $expected = $Script:ProcessAncestry[$ProcessId]
         if (-not $expected -or -not $expected.T) { return }
@@ -1066,7 +1711,7 @@ function Invoke-Kill { param([int]$ProcessId,[string]$Name,[string]$Rule,[double
         Write-Host "[KILL] $Name (PID $ProcessId) - $Rule (conf=$Conf)" -ForegroundColor Red
     } catch {
         Write-Host "[KILL FAILED] $Name (PID $ProcessId) - $($_.Exception.Message)" -ForegroundColor DarkRed
-    }
+    } finally { if ($target) { $target.Dispose() } }
 }
 
 # ============================================================================
@@ -1076,7 +1721,10 @@ function Invoke-ProcessScan {
     foreach ($ProcessId in $Script:ProcessAncestry.Keys) {
         $i = $Script:ProcessAncestry[$ProcessId]
         if (-not $i -or $ProcessId -le 4 -or $ProcessId -eq $PID) { continue }
-        $n=$i.N; $cl=$i.CL; $p=$i.P; $pp=$i.PP
+        $n=$i.N; $cl=Get-InspectedCommandLine -CommandLine $i.CL; $p=$i.P; $pp=$i.PP
+        if ($p -and -not (Is-Dup -K "ImageScan|$p" -TTL 300)) { Add-PendingFile -Path $p }
+        $payloadPath = Get-PowerShellPayloadPath -Name $n -CommandLine $i.CL
+        if ($payloadPath -and -not (Is-Dup -K "PayloadScan|$payloadPath" -TTL 300)) { Add-PendingFile -Path $payloadPath }
 
         $dets = @(
             (Test-Destructive -CL $cl -ProcessId $ProcessId -N $n),
@@ -1167,11 +1815,13 @@ function Show-Banner {
     } else {
         $checks += @{S="[UNAVAILABLE] Clipboard: no interactive desktop"; C="Yellow"}
     }
-    $checks += @{S="[ARMED] Active Response ENABLED"; C="Red"}
+    $checks += @{S="[INFO] Response mode: $Script:ResponseMode; observe-only=$Script:AuditOnly"; C="Gray"}
+    $checks += @{S="[INFO] AMSI available: $Script:AMSIAvailable; external lookups disabled: $Script:Offline"; C="Gray"}
 
     foreach ($c in $checks) { Write-Host "  $($c.S)" -ForegroundColor $c.C }
     Write-Host ""
-    Write-Host "  Processes will be KILLED on high-confidence behavioral match." -ForegroundColor Red
+    if ($Script:AuditOnly) { Write-Host '  Companion/audit: no process termination or quarantine.' -ForegroundColor Green }
+    else { Write-Host '  Standalone: process termination and content-confirmed quarantine enabled.' -ForegroundColor Red }
     Write-Host ""
     Write-Host "  Ctrl+C to stop." -ForegroundColor Gray
     Write-Host ""
@@ -1184,12 +1834,20 @@ function Show-Banner {
 
 function Invoke-ScanStage { param([string]$Name,[scriptblock]$Action)
     $ErrorActionPreference = 'Stop'
-    try { & $Action | Out-Null }
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        & $Action | Out-Null
+        $Script:StageHealth[$Name] = @{state='Completed';timeUtc=[datetime]::UtcNow.ToString('o')}
+    }
     catch {
+        $Script:StageHealth[$Name] = @{state='Failed';timeUtc=[datetime]::UtcNow.ToString('o')}
         Write-Warning "$Name scan failed: $_"
         if (-not (Is-Dup -K ("ScanError|" + $Name) -TTL 60)) {
             Log-Event -Type 'system' -Rule 'ScanError' -Evidence ([string]$_) -Reasoning "$Name stage failed; other stages continue" -Conf 1 -Tier 'System' -Meta @{stage=$Name}
         }
+    } finally {
+        $timer.Stop()
+        if ($Script:StageHealth.ContainsKey($Name)) { $Script:StageHealth[$Name].durationMs = $timer.ElapsedMilliseconds }
     }
 }
 
@@ -1204,12 +1862,19 @@ function Start-AntivirusLite {
                 Invoke-ScanStage -Name 'Process' -Action { Invoke-ProcessScan }
                 Invoke-ScanStage -Name 'Network' -Action { Invoke-NetworkAnalysis -Conns @(Get-Connections) }
                 Invoke-ScanStage -Name 'Files' -Action { Invoke-FileAnalysis }
+                Invoke-ScanStage -Name 'FileContent' -Action { Invoke-PendingFileScans }
 
                 if ($cycle % 9 -eq 0) { Invoke-ScanStage -Name 'Memory' -Action { Invoke-MemoryScan } }
                 if ($cycle % 4 -eq 0) { Invoke-ScanStage -Name 'Clipboard' -Action { Test-ClipboardAnomaly } }
                 if ($cycle % 6 -eq 0) { Invoke-ScanStage -Name 'DNS' -Action { Test-DnsAnomaly } }
                 if ($cycle % 12 -eq 0) { Invoke-ScanStage -Name 'Modules' -Action { Test-ModuleInjection } }
                 if ($cycle % 60 -eq 0) { Invoke-ScanStage -Name 'WMI' -Action { Test-WmiPersistence } }
+                if ($cycle -eq 1 -or $cycle % 60 -eq 0) { Invoke-ScanStage -Name 'Autoruns' -Action { Invoke-PersistenceInventory } }
+                if ($cycle -eq 1 -or $cycle % 12 -eq 0) {
+                    Invoke-ScanStage -Name 'SecurityEvents' -Action { Invoke-SecurityEvents }
+                    Invoke-ScanStage -Name 'SecurityPosture' -Action { Invoke-SecurityPosture }
+                    Write-HealthHeartbeat
+                }
                 if ($cycle % 6 -eq 0) { Invoke-ScanStage -Name 'Integrity' -Action { Test-SelfIntegrity } }
                 if ($cycle % 4 -eq 0) { Invoke-ScanStage -Name 'Capabilities' -Action {
                     $surveil = Test-SurveillanceAccess
@@ -1255,7 +1920,10 @@ function New-MonitorTaskDefinition {
     param([string]$UserSid, [string]$InstalledScript)
     if ([string]::IsNullOrWhiteSpace($UserSid)) { throw 'A logged-in user SID is required.' }
     $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $action = New-ScheduledTaskAction -Execute $powershell -Argument "-NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$InstalledScript`""
+    $modeArguments = ' -ResponseMode ' + $Script:ResponseMode
+    if ($Script:AuditOnly -and $Script:ResponseMode -eq 'Standalone') { $modeArguments += ' -AuditMode' }
+    if ($Script:Offline) { $modeArguments += ' -NoNetwork' }
+    $action = New-ScheduledTaskAction -Execute $powershell -Argument ("-NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$InstalledScript`"" + $modeArguments)
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserSid
     # InteractiveToken uses the existing desktop login; no account password is saved.
     $principal = New-ScheduledTaskPrincipal -UserId $UserSid -LogonType Interactive -RunLevel Highest
@@ -1334,13 +2002,31 @@ function Uninstall-AntivirusLite {
 # ENTRY POINT
 # ============================================================================
 if ($Uninstall) { Uninstall-AntivirusLite; return }
+if ($Install -and $Foreground) { throw 'Choose Install or Foreground, not both.' }
+Initialize-Storage
+if ($SelfTest) {
+    Initialize-FileEngine
+    try { Invoke-LocalSelfTest } finally { Close-FileEngine }
+    return
+}
+if ($ListQuarantine) { Get-QuarantineRecords; return }
+if ($Restore) {
+    Initialize-FileEngine -SkipAMSI
+    Restore-QuarantineFile -Id $Restore -Destination $RestorePath
+    return
+}
+if ($ScanPath) {
+    Initialize-FileEngine
+    try { Invoke-PathScan -Path $ScanPath } finally { Close-FileEngine }
+    return
+}
 if (-not $Script:InteractiveSession) {
     throw 'AntivirusLite needs an interactive desktop. Reinstall by running this script as the logged-in administrator.'
 }
 $fromInstalledPath = $PSCommandPath -and [string]::Equals(
     [IO.Path]::GetFullPath($PSCommandPath), [IO.Path]::GetFullPath($Script:InstalledScript),
     [StringComparison]::OrdinalIgnoreCase)
-if (-not $fromInstalledPath -or -not (Get-ScheduledTask -TaskName $Script:TaskName -ErrorAction SilentlyContinue)) {
+if ($Install -or (-not $Foreground -and (-not $fromInstalledPath -or -not (Get-ScheduledTask -TaskName $Script:TaskName -ErrorAction SilentlyContinue)))) {
     Install-Startup
     return
 }
@@ -1351,8 +2037,10 @@ try {
     try { $ownsMutex = $mutex.WaitOne(0) }
     catch [Threading.AbandonedMutexException] { $ownsMutex = $true }
     if (-not $ownsMutex) { return }
+    Initialize-FileEngine
     Start-AntivirusLite
 } finally {
+    Close-FileEngine
     if ($ownsMutex) { $mutex.ReleaseMutex() }
     $mutex.Dispose()
 }
